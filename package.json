@@ -1,0 +1,25 @@
+{
+  "name": "my-agent",
+  "version": "0.1.0",
+  "description": "8-week journey to build an Agent from scratch with DeepSeek API",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "d1": "tsx src/d1-hello.ts",
+    "dev": "tsx watch src/d1-hello.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.77.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
