@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "d1": "tsx src/d1-hello.ts",
+    "d2": "tsx src/d2-read-file.ts",
     "dev": "tsx watch src/d1-hello.ts",
     "typecheck": "tsc --noEmit"
   },
