@@ -61,9 +61,21 @@ export class LLMClient {
     if (opts.thinking !== undefined) body.thinking = { type: opts.thinking ? 'enabled' : 'disabled' };
     if (opts.reasoningEffort) body.reasoning_effort = opts.reasoningEffort;
 
+    if (process.env.LLM_DEBUG) {
+      console.error('\n========== [LLM REQUEST] ==========');
+      console.error(JSON.stringify(body, null, 2));
+      console.error('===================================\n');
+    }
+
     const raw = (await this.client.chat.completions.create(
       body as unknown as Parameters<typeof this.client.chat.completions.create>[0],
     )) as ChatCompletion;
+
+    if (process.env.LLM_DEBUG) {
+      console.error('\n========== [LLM RESPONSE] ==========');
+      console.error(JSON.stringify(raw, null, 2));
+      console.error('====================================\n');
+    }
 
     const usageRaw = raw.usage as
       | (ChatCompletion['usage'] & { prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number })
