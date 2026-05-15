@@ -8,6 +8,7 @@
     "d1": "tsx src/d1-hello.ts",
     "d2": "tsx src/d2-read-file.ts",
     "d3": "tsx src/d3-multi-tools.ts",
+    "d4": "tsx src/d4-bash.ts",
     "dev": "tsx watch src/d1-hello.ts",
     "typecheck": "tsc --noEmit"
   },
