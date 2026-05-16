@@ -6,19 +6,19 @@
 
 | Day | 状态 | 内容 | 提交 |
 |-----|------|------|------|
-| D1 | ✅ 完成 | Hello, DeepSeek —— 跑通 API、确认计费/缓存口径 | `172ba46` |
-| D2 | ✅ 完成 | 第一个 tool —— `read_file`，理解 OpenAI 风格的 tool calling 协议 | `ea391f7` |
-| D3 | ✅ 完成 | 加 `write_file` + `list_dir` + Tool 注册表 | `bacd26a` |
-| D4 | ✅ 完成 | 加 `run_bash`（带超时和进程隔离）+ 多轮循环 + 环境感知 System Prompt | `e371238` |
-| D5 | ✅ 完成 | 抽象出 `agentLoop()` —— 最小 Agent 内核（含完整 event 系统、abort 支持、自动工具调用） | `d7ba4b0` |
+| D1 | ✅ 完成 | Hello, DeepSeek —— 跑通 API、确认计费/缓存口径 | `172ba46` (v0.1-d1) |
+| D2 | ✅ 完成 | 第一个 tool —— `read_file`，理解 OpenAI 风格的 tool calling 协议 | `ea391f7` (v0.2-d2) |
+| D3 | ✅ 完成 | 加 `write_file` + `list_dir` + Tool 注册表 | `bacd26a` (v0.3-d3) |
+| D4 | ✅ 完成 | 加 `run_bash`（带超时和进程隔离）+ 多轮循环 + 环境感知 System Prompt | `e371238` (v0.4-d4) |
+| D5 | ✅ 完成 | 抽象出 `agentLoop()` —— 最小 Agent 内核（含完整 event 系统、abort 支持、自动工具调用） | `d7ba4b0` (v0.5-d5) |
+| — | 🔧 Runner | 新增 `scripts/run-all.ts` + `pnpm all` 一键跑 D1-D5 | `bb22e8a` (v0.5.1-runner) |
 | D6 | ⏳ 待开始 | 读 Anthropic《Building Effective Agents》+ DeepSeek Function Calling 文档 | — |
 | D7 | ⏳ 待开始 | 复盘 + 完善 `LLMClient` 抽象层 | — |
 
-> **工作区状态说明：**
-> - **D5 已提交**（`d7ba4b0`），新增：`src/agent/loop.ts`（Agent 主循环）、`src/agent/types.ts`（类型定义）、`src/d5-agent.ts`（演示入口）
-> - **新增（Untracked）：** `scripts/run-all.ts` —— 一键顺序运行 D1-D5 的脚本
-> - **已修改未暂存：** `package.json`（新增 `pnpm all` 脚本）、`tsconfig.json`（新增 `scripts/**/*` 包含路径）
-> - D1-D5 均已提交，`git log` 可查。
+> **当前状态（`HEAD -> main`）：`bb22e8a` (v0.5.1-runner)**
+> - 工作区**干净**，所有改动均已提交。
+> - D1-D5 全部完成并 tagged（`v0.1-d1` ~ `v0.5-d5`），外加 `v0.5.1-runner` 一键运行脚本。
+> - 下一个待做：D6。
 
 ## 快速开始
 
@@ -52,7 +52,7 @@ src/
   d4-bash.ts        # D4: run_bash 演示
   d5-agent.ts       # D5: agentLoop 演示
 scripts/
-  run-all.ts        # 一键运行 D1-D5（D5 后新增）
+  run-all.ts        # 一键运行 D1-D5（v0.5.1-runner）
 ```
 
 ## 模型选型
