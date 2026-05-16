@@ -63,7 +63,7 @@ function isDangerous(command: string): string | null {
     },
   };
 
-  for (const [key, value] of Object.entries(dangerousCommands) as [string, { commands: string[]; description: string }]) {
+  for (const [key, value] of Object.entries(dangerousCommands)) {
     if (value.commands.some((needle: string) => command.includes(needle))) {
       return `${key}: ${value.description}`;
     }

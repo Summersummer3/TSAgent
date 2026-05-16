@@ -1,29 +1,7 @@
 import 'dotenv/config';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { createDeepSeekClient } from './llm/client.ts';
-import { tools, allToolSchemas, getTool } from './tools/registry.ts';
-
-async function executeToolCall(
-  call: { id: string; function: { name: string; arguments: string } },
-): Promise<string> {
-  let parsedArgs: unknown;
-  try {
-    parsedArgs = JSON.parse(call.function.arguments);
-  } catch (err) {
-    return `Error: invalid JSON arguments — ${(err as Error).message}`;
-  }
-
-  const tool = getTool(call.function.name);
-  if (!tool) {
-    return `Error: unknown tool "${call.function.name}". Available: ${Object.keys(tools).join(', ')}`;
-  }
-
-  try {
-    return await tool.handler(parsedArgs);
-  } catch (err) {
-    return `Error: ${(err as Error).message}`;
-  }
-}
+import { tools,allToolSchemas, executeToolCall } from './tools/registry.ts';
 
 async function main() {
   console.log('--- D3: Multi-tool routing via registry ---');

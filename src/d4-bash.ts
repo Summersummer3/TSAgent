@@ -1,31 +1,9 @@
 import 'dotenv/config';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { createDeepSeekClient } from './llm/client.ts';
-import { tools, allToolSchemas, getTool } from './tools/registry.ts';
+import { tools, allToolSchemas, executeToolCall } from './tools/registry.ts';
 
 const MAX_ROUNDS = 8;
-
-async function executeToolCall(
-  call: { id: string; function: { name: string; arguments: string } },
-): Promise<string> {
-  let parsedArgs: unknown;
-  try {
-    parsedArgs = JSON.parse(call.function.arguments);
-  } catch (err) {
-    return `Error: invalid JSON arguments — ${(err as Error).message}`;
-  }
-
-  const tool = getTool(call.function.name);
-  if (!tool) {
-    return `Error: unknown tool "${call.function.name}". Available: ${Object.keys(tools).join(', ')}`;
-  }
-
-  try {
-    return await tool.handler(parsedArgs);
-  } catch (err) {
-    return `Error: ${(err as Error).message}`;
-  }
-}
 
 async function main() {
   console.log('--- D4: run_bash + multi-round loop ---');
