@@ -11,3 +11,5 @@ traces/
 
 src-list.txt
 *.scratch.*
+
+!notes/
