@@ -2,6 +2,11 @@ import 'dotenv/config';
 import { createDeepSeekClient } from './llm/client.ts';
 import { tools } from './tools/registry.ts';
 import { agentLoop } from './agent/loop.ts';
+import {
+  commandBlacklistGate,
+  pathProtectionGate,
+  workspacePathGate,
+} from './agent/gates.ts';
 
 async function main() {
   console.log('--- D5: Agent Loop ---');
@@ -23,6 +28,17 @@ async function main() {
       '通过当前项目情况，更新当前 README.md 确认进度。',
     tools:     tools,
     maxRounds: 30,
+    // D8: pre-gates 统一管"能不能跑". 工具自己不再做这些检查。
+    preGates: [
+      workspacePathGate({ appliesTo: ['read_file', 'write_file', 'list_dir'] }),
+      commandBlacklistGate(),
+      // 真实工程教训: D5 跑 regression 时 agent 自作主张 overwrite README.
+      // 加这条就堵住了 —— 现在它必须先问 (或换路径)。
+      pathProtectionGate({
+        appliesTo: ['write_file'],
+        readonlyGlobs: ['.git/**', 'package.json', 'package-lock.json', 'tsconfig.json'],
+      }),
+    ],
     onEvent: (e) => {
         // 在这里设计你的 trace 输出格式，比如：
         // [round 1] llm_response  finish=tool_calls  cost=$0.0003  tool_calls=2
@@ -49,6 +65,9 @@ async function main() {
         }
         if (e.type === 'aborted') {
           console.log(`  [Aborted] ${e.reason}`);
+        }
+        if (e.type === 'gate_fail') {
+          console.log(`  [Gate ${e.phase}/${e.action.toUpperCase()}] ${e.toolName}: ${e.reason}`);
         }
         if (e.type === 'error') {
           console.log(`  [Error] ${e.error.message}`);

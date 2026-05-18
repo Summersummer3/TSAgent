@@ -22,12 +22,14 @@ export type ToolResult<T = unknown> =
   | { ok: false; error: string; retryable: boolean; forLLM?: string };
 
 /**
- * Gate 的判决。D7 笔记里说的"程序化检查点"。
+ * Gate 的判决。D7 引入的"程序化检查点"。
  *
  * - pass:    通过, 继续往下走
- * - retry:   告诉 LLM "格式/内容不对, 请改 args 重试" (把 reason 拼到 forLLM 里喂回)
- * - abort:   直接终止整个 agent loop (用于硬安全策略)
- * - rewrite: 替换给 LLM 看的内容 (例: 截断超长输出, 脱敏)
+ * - retry:   告诉 LLM "格式/内容/权限不对, 请改 args 重试" (把 reason 喂回)
+ * - abort:   直接终止整个 agent loop (用于硬安全策略, 例如配额超)
+ * - rewrite: 仅 post-gate 有意义。替换 forLLM 内容 (例: 截断超长输出, 脱敏)
+ *
+ * Pre-gate 返回 rewrite 是无效的, loop 会按 pass 处理 (因为 handler 没跑, 没东西可改写)。
  */
 export type GateDecision =
   | { action: 'pass' }
@@ -35,15 +37,31 @@ export type GateDecision =
   | { action: 'abort'; reason: string }
   | { action: 'rewrite'; newForLLM: string };
 
-export interface GateContext {
+/**
+ * Pre-execution gate: handler 调用之前的检查 —— "能不能跑"
+ * 典型用途: 黑名单 / 路径权限 / 配额检查 / args 业务校验
+ *
+ * 注意 ctx 里没有 result, 因为还没跑。
+ */
+export interface PreGateContext {
   toolName: string;
-  args: unknown;        // parse 后的 args; parse 失败则为 null
+  args: unknown;        // 已经 JSON.parse, 但还没 zod 校验
+  round: number;
+}
+export type PreGate = (ctx: PreGateContext) => GateDecision | Promise<GateDecision>;
+
+/**
+ * Post-execution gate: handler 跑完之后的检查 —— "跑出来的对不对"
+ * 典型用途: schema 校验 / 内容过滤 / 截断 / 脱敏
+ */
+export interface PostGateContext {
+  toolName: string;
+  args: unknown;
   result: ToolResult;
   round: number;
-  attempt: number;      // tool-level 第几次尝试 (从 1 开始)
+  attempt: number;
 }
-
-export type Gate = (ctx: GateContext) => GateDecision | Promise<GateDecision>;
+export type PostGate = (ctx: PostGateContext) => GateDecision | Promise<GateDecision>;
 
 export interface UsageInfo {
   promptTokens: number;
@@ -74,8 +92,20 @@ export interface AgentLoopOptions {
   maxToolAttempts?: number;
   temperature?: number;
   abortSignal?: AbortSignal;
-  /** D7: post-execution gates, 按顺序执行 */
-  gates?: Gate[];
+  /**
+   * Pre-execution gates: handler 调用之前按顺序跑。
+   * 首个 non-pass 决定就 short-circuit (retry 喂回 LLM / abort 终止 loop)。
+   * 典型用途: 黑名单、路径白名单、readonly 文件保护。
+   */
+  preGates?: PreGate[];
+  /**
+   * Post-execution gates: handler 跑完后按顺序跑。
+   * 典型用途: schema 校验、长度截断、内容脱敏。
+   * (兼容 D7 早期代码: 别名 `gates` 也保留)
+   */
+  postGates?: PostGate[];
+  /** @deprecated 用 postGates, 这个保留是为了 D7 代码不破 */
+  gates?: PostGate[];
   onEvent?: (event: AgentEvent) => void;
 }
 
@@ -117,6 +147,7 @@ export type AgentEvent =
     }
   | {
       type: 'gate_fail';    // D7: gate 没放行
+      phase: 'pre' | 'post';
       toolName: string;
       action: Exclude<GateDecision['action'], 'pass'>;
       reason: string;

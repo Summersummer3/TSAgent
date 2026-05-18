@@ -17,7 +17,7 @@
 import 'dotenv/config';
 import { createDeepSeekClient } from './llm/client.ts';
 import { agentLoop } from './agent/loop.ts';
-import { jsonSchemaGate } from './agent/gates.ts';
+import { jsonSchemaGate, workspacePathGate } from './agent/gates.ts';
 import { tools as baseTools } from './tools/registry.ts';
 import {
   ReviewArgs,
@@ -91,7 +91,10 @@ async function main() {
     tools,
     maxRounds: 8,
     maxToolAttempts: 2,
-    gates: [
+    preGates: [
+      workspacePathGate({ appliesTo: ['read_file'] }),
+    ],
+    postGates: [
       jsonSchemaGate({
         appliesTo: 'submit_review',
         schema: ReviewArgs,

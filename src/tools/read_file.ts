@@ -61,16 +61,10 @@ export async function readFile(
     };
   }
 
+  // 注: 路径安全检查 (workspace 边界) 已下沉到框架层 workspacePathGate (D8)。
+  //     工具自己不再做这件事 —— 安全策略集中, 不再散布在每个工具里。
   const workspaceRoot = process.cwd();
   const resolved = path.resolve(workspaceRoot, parsed.data.path);
-
-  if (!resolved.startsWith(workspaceRoot)) {
-    return {
-      ok: false,
-      error: `Refused: path "${parsed.data.path}" resolves outside the workspace (${resolved}).`,
-      retryable: false,
-    };
-  }
 
   try {
     const content = await fs.readFile(resolved, 'utf-8');

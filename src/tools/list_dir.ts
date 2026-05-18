@@ -132,15 +132,9 @@ export async function listDir(
   }
   const args = parsed.data;
 
+  // 注: 路径安全检查 (workspace 边界) 已下沉到框架层 workspacePathGate (D8)。
   const workspaceRoot = process.cwd();
   const resolved = path.resolve(workspaceRoot, args.path);
-  if (!resolved.startsWith(workspaceRoot)) {
-    return {
-      ok: false,
-      error: `Refused: path "${args.path}" resolves outside the workspace (${resolved}).`,
-      retryable: false,
-    };
-  }
 
   const lines: string[] = [];
   let count = 0;

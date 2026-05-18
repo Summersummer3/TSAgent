@@ -21,53 +21,28 @@ const RunBashArgs = z.object({
 
 export type RunBashArgs = z.infer<typeof RunBashArgs>;
 
-// ─────────────────────────────────────────────────────────────────────
-// TODO 2: 设计黑名单
-//
-// 思路：写一个 isDangerous(command) 函数返回 boolean
-// 关键的危险模式（不用穷尽，先挡住明显的炸弹）：
-//   - 'rm -rf /'   'rm -rf ~'   'rm -rf $HOME'
-//   - 'sudo '       'su -'
-//   - 'mkfs'        'dd if=/dev/'
-//   - '> /dev/sd'   ':(){:|:&};:'   (fork bomb)
-//   - 'shutdown'    'reboot'
-//
-// 提示：
-//   - 简单 substring + 正则就够，不用完美
-//   - 注意 'rm -rf /' 不要误伤 './rm-rf' 这种文件名（虽然不太可能）
-//   - 返回不仅是 true/false，最好返回触发了哪条规则，方便给 LLM 看
-// ─────────────────────────────────────────────────────────────────────
+/**
+ * 纵深防御 (defense-in-depth) 的硬性底线。
+ *
+ * 完整的、可配置的命令黑名单已下沉到框架层 commandBlacklistGate (D8) ——
+ * 任何走 agentLoop 的 demo (D5/D7+) 都应该挂上它。
+ *
+ * 这里保留 3 条"绝对不能跑"的最致命命令, 作为最后一道防线:
+ *   - 防止上层 gate 被错误配置 / 忘了挂时, tool 仍然不会让人下岗
+ *   - 适用于走 executeToolCall (D3/D4 教学化石) 而非 agentLoop 的旧 demo
+ *
+ * 注意: 不要在这里加复杂规则! 复杂策略归 commandBlacklistGate, 这里只挡核弹。
+ */
+const HARDCODED_LAST_RESORT: Array<{ needle: string; reason: string }> = [
+  { needle: 'rm -rf /',    reason: 'rm -rf / (system wipe)' },
+  { needle: 'mkfs',        reason: 'mkfs (filesystem format)' },
+  { needle: ':(){:|:&};:', reason: 'fork bomb' },
+];
 
-function isDangerous(command: string): string | null {
-  // YOUR CODE HERE
-  // 返回 null 表示安全，返回字符串说明触发了哪条规则
-  const dangerousCommands = {
-    delete: {
-      commands: ['rm -rf /', 'rm -rf ~', 'rm -rf $HOME'],
-      description: 'dangerous delete command',
-    },
-    system: {
-      commands: ['sudo ', 'su -'],
-      description: 'dangerous system command',
-    },
-    disk: {
-      commands: ['mkfs', 'dd if=/dev/', '> /dev/sd'],
-      description: 'dangerous disk command',
-    },
-    forkBomb: {
-      commands: [':(){:|:&};:'],
-      description: 'dangerous fork bomb command',
-    },
-    shutdown: {
-      commands: ['shutdown', 'reboot'],
-      description: 'dangerous shutdown command',
-    },
-  };
-
-  for (const [key, value] of Object.entries(dangerousCommands)) {
-    if (value.commands.some((needle: string) => command.includes(needle))) {
-      return `${key}: ${value.description}`;
-    }
+function lastResortCheck(command: string): string | null {
+  const lower = command.toLowerCase();
+  for (const r of HARDCODED_LAST_RESORT) {
+    if (lower.includes(r.needle.toLowerCase())) return r.reason;
   }
   return null;
 }
@@ -231,13 +206,15 @@ export async function runBash(
   }
   const args = parsed.data;
 
-  const trigger = isDangerous(args.command);
-  if (trigger) {
+  // 纵深防御: 最后一道硬性底线 (3 条最致命的命令)。
+  // 详细策略归框架层 commandBlacklistGate; 这里只防"上层忘挂 gate"的灾难。
+  const lastResort = lastResortCheck(args.command);
+  if (lastResort) {
     return {
       ok: false,
-      error: `Refused by blacklist: ${trigger}`,
+      error: `Refused (last-resort): ${lastResort}`,
       retryable: false,
-      forLLM: `Refused: ${trigger}. Pick a different approach.`,
+      forLLM: `Refused (last-resort safety): ${lastResort}. Use a safer approach.`,
     };
   }
 

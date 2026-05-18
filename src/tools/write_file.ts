@@ -119,15 +119,10 @@ export async function writeFile(
   }
   const args = parsed.data;
 
+  // 注: 路径安全检查 (workspace 边界 / readonly 保护) 已下沉到框架层
+  //     workspacePathGate + pathProtectionGate (D8)。
   const workspaceRoot = process.cwd();
   const resolved = path.resolve(workspaceRoot, args.path);
-  if (!resolved.startsWith(workspaceRoot)) {
-    return {
-      ok: false,
-      error: `Refused: path "${args.path}" resolves outside the workspace (${resolved}).`,
-      retryable: false,
-    };
-  }
 
   try {
     await fs.mkdir(path.dirname(resolved), { recursive: true });

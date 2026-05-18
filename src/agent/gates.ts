@@ -1,17 +1,27 @@
 /**
- * D7: 内置 Gate 工厂。
+ * Gate 工厂集合。
  *
- * Gate 是一个 (ctx) => GateDecision 的函数; 这个文件提供常用 Gate 的工厂函数,
- * 让上层 (d7-gated-agent.ts) 用声明式风格组合规则, 而不是自己实现 Gate 函数。
+ * Gate 是一个 (ctx) => GateDecision 的函数; 这里提供常用 Gate 工厂函数,
+ * 让上层 demo 用声明式风格组合规则, 而不是自己实现 Gate。
  *
  * 设计原则:
- * - 每个 Gate 只关心一件事 (single responsibility)。
- * - 不归这个 Gate 管的工具/情况, 一律返回 { action: 'pass' }。
- * - Gate 内部不抛错; 任何检查失败都用 { action: 'retry' | 'abort' | 'rewrite' } 表达。
+ * - 每个 Gate 只关心一件事 (single responsibility)
+ * - 不归这个 Gate 管的工具/情况, 一律返回 { action: 'pass' }
+ * - Gate 内部不抛错; 任何检查失败都用 { action: 'retry' | 'abort' | 'rewrite' } 表达
+ *
+ * Pre-gate 类 (handler 之前, 决定"能不能跑"):
+ *   - workspacePathGate:    限定路径必须在 workspace 内
+ *   - commandBlacklistGate: bash 命令黑名单
+ *   - pathProtectionGate:   保护只读文件 (例 README / .git / package.json)
+ *
+ * Post-gate 类 (handler 之后, 决定"跑出来对不对"):
+ *   - jsonSchemaGate: 用 zod 校验 result.data
+ *   - truncateGate:   超长 forLLM 截断
  */
 
+import path from 'node:path';
 import type { z } from 'zod';
-import type { Gate } from './types.ts';
+import type { PostGate, PreGate } from './types.ts';
 
 /**
  * jsonSchemaGate: 校验某个 tool 的 ToolResult.data 是否符合 zod schema。
@@ -36,7 +46,7 @@ export function jsonSchemaGate(opts: {
   appliesTo: string | string[];
   schema: z.ZodSchema;
   retryHint?: string;
-}): Gate {
+}): PostGate {
   const applyTo = Array.isArray(opts.appliesTo) ? opts.appliesTo : [opts.appliesTo];
   return ({ toolName, result }) => {
     if (!applyTo.includes(toolName)) return { action: 'pass' };
@@ -67,7 +77,7 @@ export function truncateGate(opts: {
   appliesTo?: string | string[];   // 不传则对所有 tool 生效
   maxChars: number;
   notice?: string;
-}): Gate {
+}): PostGate {
   const apply = opts.appliesTo
     ? Array.isArray(opts.appliesTo)
       ? opts.appliesTo
@@ -84,4 +94,150 @@ export function truncateGate(opts: {
       ?? `\n\n[...truncated, original was ${current.length} chars, shown first ${opts.maxChars}]`;
     return { action: 'rewrite', newForLLM: head + notice };
   };
+}
+
+// =====================================================================
+// PRE-EXECUTION GATES (handler 之前, 决定"能不能跑")
+// =====================================================================
+
+/**
+ * workspacePathGate: 拦截"路径不在 workspace 内"的工具调用。
+ *
+ * 适用于任何接收 `path` 字段的工具 (read_file / write_file / list_dir)。
+ * 把"工作区边界"这个安全策略从工具内部抽到框架层, 任何新增的文件类工具
+ * 只要把名字加进 appliesTo 就自动享受这个保护, 不需要每个工具重写校验。
+ */
+export function workspacePathGate(opts: {
+  appliesTo: string[];
+  workspaceRoot?: string;          // 默认 process.cwd()
+  pathField?: string;              // 默认 'path'
+}): PreGate {
+  const root = opts.workspaceRoot ?? process.cwd();
+  const field = opts.pathField ?? 'path';
+  const setApplies = new Set(opts.appliesTo);
+
+  return ({ toolName, args }) => {
+    if (!setApplies.has(toolName)) return { action: 'pass' };
+    if (!args || typeof args !== 'object') return { action: 'pass' };
+
+    const raw = (args as Record<string, unknown>)[field];
+    if (typeof raw !== 'string' || !raw) return { action: 'pass' };
+
+    const resolved = path.resolve(root, raw);
+    if (!resolved.startsWith(root)) {
+      return {
+        action: 'retry',
+        reason: `path "${raw}" resolves outside the workspace (${resolved}). Use a path within ${root}.`,
+      };
+    }
+    return { action: 'pass' };
+  };
+}
+
+/**
+ * commandBlacklistGate: run_bash 的命令黑名单。
+ *
+ * 取代 run_bash.ts 内部的 isDangerous(), 集中在框架层。
+ * 默认带一组明显危险命令; 可通过 extraRules 追加项目特定规则。
+ */
+const DEFAULT_BASH_BLACKLIST: Array<{ needle: string; reason: string }> = [
+  { needle: 'rm -rf /',       reason: 'destructive: rm -rf /' },
+  { needle: 'rm -rf ~',       reason: 'destructive: rm -rf ~' },
+  { needle: 'rm -rf $HOME',   reason: 'destructive: rm -rf $HOME' },
+  { needle: 'sudo ',          reason: 'privilege escalation: sudo' },
+  { needle: 'su -',           reason: 'privilege escalation: su -' },
+  { needle: 'mkfs',           reason: 'filesystem corruption: mkfs' },
+  { needle: 'dd if=/dev/',    reason: 'disk write: dd' },
+  { needle: '> /dev/sd',      reason: 'raw disk write' },
+  { needle: ':(){:|:&};:',    reason: 'fork bomb' },
+  { needle: 'shutdown',       reason: 'shutdown' },
+  { needle: 'reboot',         reason: 'reboot' },
+];
+
+export function commandBlacklistGate(opts?: {
+  tool?: string;                                              // 默认 'run_bash'
+  commandField?: string;                                      // 默认 'command'
+  extraRules?: Array<{ needle: string; reason: string }>;
+  useDefaults?: boolean;                                      // 默认 true
+}): PreGate {
+  const toolName = opts?.tool ?? 'run_bash';
+  const field = opts?.commandField ?? 'command';
+  const useDefaults = opts?.useDefaults ?? true;
+  const rules = [
+    ...(useDefaults ? DEFAULT_BASH_BLACKLIST : []),
+    ...(opts?.extraRules ?? []),
+  ];
+
+  return ({ toolName: name, args }) => {
+    if (name !== toolName) return { action: 'pass' };
+    if (!args || typeof args !== 'object') return { action: 'pass' };
+    const cmd = (args as Record<string, unknown>)[field];
+    if (typeof cmd !== 'string') return { action: 'pass' };
+
+    const lower = cmd.toLowerCase();
+    for (const rule of rules) {
+      if (lower.includes(rule.needle.toLowerCase())) {
+        return {
+          action: 'retry',
+          reason: `Refused by blacklist (${rule.reason}). Use a different approach.`,
+        };
+      }
+    }
+    return { action: 'pass' };
+  };
+}
+
+/**
+ * pathProtectionGate: 保护只读路径。
+ *
+ * 用于 write_file / run_bash —— 防止 agent 随手改 README / package.json / .git。
+ * 这就是修 "D5 自作主张改 README" 那个 bug 的工具。
+ *
+ * 匹配规则: glob 风格 (双星 = 任意路径, 单星 = 任意文件名段)。
+ *   'README.md'       -> 完全匹配相对路径
+ *   '.git/<<>>'       -> .git 下所有路径 (实际写: .git/ + 双星)
+ *   '<<>>/<<>>.lock'  -> 任意位置的 .lock 文件 (实际写: 双星 / 单星 .lock)
+ * (此处的 <<>> 仅为避免破坏 JSDoc; 真正传参时直接写 ** 或 *)
+ */
+export function pathProtectionGate(opts: {
+  appliesTo: string[];                                        // 例 ['write_file']
+  readonlyGlobs: string[];
+  pathField?: string;                                         // 默认 'path'
+  workspaceRoot?: string;
+}): PreGate {
+  const root = opts.workspaceRoot ?? process.cwd();
+  const field = opts.pathField ?? 'path';
+  const setApplies = new Set(opts.appliesTo);
+  const matchers = opts.readonlyGlobs.map(globToRegExp);
+
+  return ({ toolName, args }) => {
+    if (!setApplies.has(toolName)) return { action: 'pass' };
+    if (!args || typeof args !== 'object') return { action: 'pass' };
+    const raw = (args as Record<string, unknown>)[field];
+    if (typeof raw !== 'string' || !raw) return { action: 'pass' };
+
+    const resolved = path.resolve(root, raw);
+    const rel = path.relative(root, resolved);
+
+    for (let i = 0; i < matchers.length; i++) {
+      if (matchers[i]!.test(rel)) {
+        return {
+          action: 'retry',
+          reason: `Refused: "${rel}" is protected (matches "${opts.readonlyGlobs[i]}"). Write to a different file or ask the user.`,
+        };
+      }
+    }
+    return { action: 'pass' };
+  };
+}
+
+// 极简 glob → regex: 支持 ** (任意路径) 和 * (任意非 / 字符)。
+// 不追求功能完备 —— minimatch / picomatch 等成熟实现留给 Day-X。
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '__DOUBLESTAR__')
+    .replace(/\*/g, '[^/]*')
+    .replace(/__DOUBLESTAR__/g, '.*');
+  return new RegExp('^' + escaped + '$');
 }

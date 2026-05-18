@@ -13,7 +13,9 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
   const maxRounds = opts.maxRounds ?? AGENT_LOOP_DEFAULTS.maxRounds;
   const maxToolAttempts = opts.maxToolAttempts ?? AGENT_LOOP_DEFAULTS.maxToolAttempts;
   const temperature = opts.temperature ?? AGENT_LOOP_DEFAULTS.temperature;
-  const gates = opts.gates ?? [];
+  const preGates = opts.preGates ?? [];
+  // D8: 旧名 `gates` 兼容; 新名 `postGates` 优先
+  const postGates = opts.postGates ?? opts.gates ?? [];
   const emit = (e: AgentEvent) => opts.onEvent?.(e);
 
   // ① 工具 schema 在整个 loop 里都不变，提前算一次即可。
@@ -92,9 +94,16 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
         const t0 = Date.now();
         const tool = opts.tools[call.function.name];
 
-        let result: ToolResult;
+        // Placeholder 初值: 仅为让 TS 控制流通过。
+        // 下面所有分支都会重新赋值; 如果你看到这条 error 出现在 LLM 那, 说明控制流有 bug。
+        let result: ToolResult = {
+          ok: false,
+          error: 'agent loop bug: result not assigned',
+          retryable: false,
+        };
         let parsedArgs: unknown = null;
         let attempt = 0;
+        let preGateBlocked = false;
 
         if (!tool) {
           result = {
@@ -105,35 +114,106 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
           };
           attempt = 1;
         } else {
-          // ③.1 Tool-level retry —— 只为 retryable 临时错误循环, 永久错误一遍喂回 LLM
-          while (true) {
-            attempt++;
-            try {
-              parsedArgs = JSON.parse(call.function.arguments);
-              result = await tool.handler(parsedArgs);
-            } catch (err) {
+          // ③.0 Pre-gate pipeline (handler 之前)
+          //     - 任何 retry/abort 直接 short-circuit, handler 不跑
+          //     - rewrite 在 pre 阶段无意义 → 视为 pass
+          try {
+            parsedArgs = JSON.parse(call.function.arguments);
+          } catch (err) {
+            result = {
+              ok: false,
+              error: `invalid JSON args: ${(err as Error).message}`,
+              retryable: false,
+              forLLM: `Error: invalid JSON args — ${(err as Error).message}`,
+            };
+            attempt = 1;
+            preGateBlocked = true; // 提前结束, 不进 retry 循环
+          }
+
+          if (!preGateBlocked) {
+            for (const gate of preGates) {
+              const decision = await gate({
+                toolName: call.function.name,
+                args: parsedArgs,
+                round,
+              });
+              if (decision.action === 'pass' || decision.action === 'rewrite') continue;
+
+              if (decision.action === 'abort') {
+                emit({
+                  type: 'gate_fail',
+                  phase: 'pre',
+                  toolName: call.function.name,
+                  action: 'abort',
+                  reason: decision.reason,
+                });
+                messages.push({
+                  role: 'tool',
+                  tool_call_id: call.id,
+                  content: `Aborted by pre-gate: ${decision.reason}`,
+                });
+                emit({
+                  type: 'tool_result',
+                  id: call.id,
+                  name: call.function.name,
+                  result: `Aborted by pre-gate: ${decision.reason}`,
+                  durationMs: Date.now() - t0,
+                  isError: true,
+                });
+                return finish('gate_abort', null, round);
+              }
+
+              // retry: handler 不跑, 把 reason 当 tool_result 喂回 LLM
               result = {
                 ok: false,
-                error: `args parse / handler crash: ${(err as Error).message}`,
+                error: decision.reason,
                 retryable: false,
-                forLLM: `Error: ${(err as Error).message}`,
+                forLLM: `Refused by pre-gate: ${decision.reason}`,
               };
-            }
-
-            if (!result.ok && result.retryable && attempt < maxToolAttempts) {
               emit({
-                type: 'tool_retry',
-                name: call.function.name,
-                attempt,
-                reason: result.error,
+                type: 'gate_fail',
+                phase: 'pre',
+                toolName: call.function.name,
+                action: 'retry',
+                reason: decision.reason,
               });
-              continue;
+              attempt = 1;
+              preGateBlocked = true;
+              break;
             }
-            break;
+          }
+
+          // ③.1 Tool-level retry —— 只为 retryable 临时错误循环
+          if (!preGateBlocked) {
+            while (true) {
+              attempt++;
+              try {
+                result = await tool.handler(parsedArgs);
+              } catch (err) {
+                result = {
+                  ok: false,
+                  error: `handler crash: ${(err as Error).message}`,
+                  retryable: false,
+                  forLLM: `Error: ${(err as Error).message}`,
+                };
+              }
+
+              if (!result.ok && result.retryable && attempt < maxToolAttempts) {
+                emit({
+                  type: 'tool_retry',
+                  name: call.function.name,
+                  attempt,
+                  reason: result.error,
+                });
+                continue;
+              }
+              break;
+            }
           }
         }
 
-        // ③.2 Gate pipeline (post-execution)
+        // ③.2 Post-gate pipeline (handler 之后)
+        //     - 只有 handler 真的跑过 (没被 preGate 拦) 才会跑 postGates
         let finalForLLM =
           result.forLLM
           ?? (result.ok
@@ -142,8 +222,8 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
         let gateAction: GateDecision['action'] = 'pass';
         let gateReason: string | null = null;
 
-        if (tool) {
-          for (const gate of gates) {
+        if (tool && !preGateBlocked) {
+          for (const gate of postGates) {
             const decision = await gate({
               toolName: call.function.name,
               args: parsedArgs,
@@ -172,6 +252,7 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
               gateReason = decision.reason;
               emit({
                 type: 'gate_fail',
+                phase: 'post',
                 toolName: call.function.name,
                 action: 'abort',
                 reason: decision.reason,
@@ -208,6 +289,7 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
         if (gateAction !== 'pass' && gateAction !== 'abort') {
           emit({
             type: 'gate_fail',
+            phase: 'post',
             toolName: call.function.name,
             action: gateAction,
             reason: gateReason ?? 'unknown',
