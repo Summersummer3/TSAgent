@@ -17,7 +17,12 @@
 import 'dotenv/config';
 import { createDeepSeekClient } from './llm/client.ts';
 import { agentLoop } from './agent/loop.ts';
-import { jsonSchemaGate, workspacePathGate } from './agent/gates.ts';
+import {
+  fileExtensionGate,
+  jsonSchemaGate,
+  truncateGate,
+  workspacePathGate,
+} from './agent/gates.ts';
 import { tools as baseTools } from './tools/registry.ts';
 import {
   ReviewArgs,
@@ -91,10 +96,20 @@ async function main() {
     tools,
     maxRounds: 8,
     maxToolAttempts: 2,
+    // D8: 完整的"生产级"安全栈 —— pre 拦危险, post 校结果
     preGates: [
+      // 1) 路径必须在 workspace 内 (防 ../../etc/passwd)
       workspacePathGate({ appliesTo: ['read_file'] }),
+      // 2) 只准读 .md/.txt 类纯文本 (防 LLM 误读 .env / package-lock.json / node_modules)
+      fileExtensionGate({
+        appliesTo: ['read_file'],
+        allowedExtensions: ['.md', '.txt'],
+      }),
     ],
     postGates: [
+      // 1) 超大文件截断 (防 100MB 文件爆 context 窗口)
+      truncateGate({ appliesTo: 'read_file', maxChars: 20_000 }),
+      // 2) submit_review 的 args 必须严格符合 zod schema, 否则退回 LLM 自修
       jsonSchemaGate({
         appliesTo: 'submit_review',
         schema: ReviewArgs,

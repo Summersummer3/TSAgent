@@ -231,6 +231,45 @@ export function pathProtectionGate(opts: {
   };
 }
 
+/**
+ * fileExtensionGate: 白名单扩展名 (对偶 pathProtectionGate 的黑名单)。
+ *
+ * 黑名单 vs 白名单的工程取舍:
+ *   - pathProtectionGate (黑名单): 已知哪些不能动 → 列出来
+ *   - fileExtensionGate  (白名单): 已知只能动哪些 → 列出来
+ *   两种都有用, 取决于"已知" vs "未知" 哪边的空间更小。
+ *
+ * 典型用法:
+ *   - read_file 限定只读 .md/.txt → 防止 LLM 读 .env / package-lock.json / node_modules
+ *   - write_file 限定只能写 .md → 防止 LLM 改源代码
+ */
+export function fileExtensionGate(opts: {
+  appliesTo: string[];
+  allowedExtensions: string[];   // 例 ['.md', '.txt']; 不区分大小写
+  pathField?: string;            // 默认 'path'
+}): PreGate {
+  const field = opts.pathField ?? 'path';
+  const setApplies = new Set(opts.appliesTo);
+  const allowed = new Set(opts.allowedExtensions.map((e) => e.toLowerCase()));
+
+  return ({ toolName, args }) => {
+    if (!setApplies.has(toolName)) return { action: 'pass' };
+    if (!args || typeof args !== 'object') return { action: 'pass' };
+    const raw = (args as Record<string, unknown>)[field];
+    if (typeof raw !== 'string' || !raw) return { action: 'pass' };
+
+    const ext = path.extname(raw).toLowerCase();
+    if (!allowed.has(ext)) {
+      const allowedStr = Array.from(allowed).join(', ');
+      return {
+        action: 'retry',
+        reason: `Refused: extension "${ext || '(none)'}" not in allow-list [${allowedStr}]. Path was "${raw}".`,
+      };
+    }
+    return { action: 'pass' };
+  };
+}
+
 // 极简 glob → regex: 支持 ** (任意路径) 和 * (任意非 / 字符)。
 // 不追求功能完备 —— minimatch / picomatch 等成熟实现留给 Day-X。
 function globToRegExp(glob: string): RegExp {
