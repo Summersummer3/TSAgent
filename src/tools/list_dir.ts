@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
+import type { ToolResult } from '../agent/types.ts';
 
 // ─────────────────────────────────────────────────────────────────────
 // TODO: zod schema
@@ -101,42 +102,122 @@ export const listDirTool: ChatCompletionTool = {
 //   返回 lines.join('\n')，如果 lines 为空返回 '(empty directory)'
 // ─────────────────────────────────────────────────────────────────────
 
-export async function listDir(rawArgs: unknown): Promise<string> {
-  // YOUR CODE HERE
-  const args = ListDirArgs.parse(rawArgs);
+export interface ListDirData {
+  root: string;          // relative to workspace
+  depthRequested: number;
+  totalEntries: number;
+  truncatedByLimit: boolean;
+  depthLimitHit: boolean;
+  tree: string;          // 文本树
+}
+
+/**
+ * D7 重构: 返回 ToolResult<ListDirData>。
+ *
+ * data.tree 给人/Gate 看; data.totalEntries 等可让 Gate 判断"目录太空/太满"。
+ * forLLM 直接喂 tree (LLM 只关心结构)。
+ */
+export async function listDir(
+  rawArgs: unknown,
+): Promise<ToolResult<ListDirData>> {
+  const parsed = ListDirArgs.safeParse(rawArgs);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: `invalid args: ${parsed.error.issues
+        .map((i) => `${i.path.join('.')}: ${i.message}`)
+        .join('; ')}`,
+      retryable: false,
+    };
+  }
+  const args = parsed.data;
+
   const workspaceRoot = process.cwd();
   const resolved = path.resolve(workspaceRoot, args.path);
   if (!resolved.startsWith(workspaceRoot)) {
-    throw new Error(`Refused: path "${args.path}" resolves outside the workspace (${resolved}).`);
+    return {
+      ok: false,
+      error: `Refused: path "${args.path}" resolves outside the workspace (${resolved}).`,
+      retryable: false,
+    };
   }
 
   const lines: string[] = [];
   let count = 0;
+  let truncatedByLimit = false;
+  let depthLimitHit = false;
   const LIMIT = 100;
   const SKIP = new Set(['node_modules', '.git', 'dist']);
-  
-  lines.push("\n" + resolved + "\n");
-  async function walk(dir: string, level: number, currentDepth: number) {
+
+  async function walk(
+    dir: string,
+    level: number,
+    currentDepth: number,
+  ): Promise<void> {
     if (currentDepth >= args.depth) {
-        lines.push('... (depth limit reached)');
-        return;
+      depthLimitHit = true;
+      return;
     }
-    const entries = await fs.readdir(dir, { withFileTypes: true });
+    let entries: import('node:fs').Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     entries.sort((a, b) => {
       if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
     for (const e of entries) {
       if (count >= LIMIT) {
-        lines.push('... (limit reached)');
-        break;
+        truncatedByLimit = true;
+        return;
       }
       if (e.name.startsWith('.') || SKIP.has(e.name)) continue;
       lines.push('  '.repeat(level) + e.name + (e.isDirectory() ? '/' : ''));
       count++;
-      if (e.isDirectory()) await walk(path.join(dir, e.name), level+1, currentDepth+1);
+      if (e.isDirectory()) {
+        await walk(path.join(dir, e.name), level + 1, currentDepth + 1);
+      }
     }
   }
+
+  try {
+    const stat = await fs.stat(resolved);
+    if (!stat.isDirectory()) {
+      return {
+        ok: false,
+        error: `Not a directory: ${args.path}`,
+        retryable: false,
+      };
+    }
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    return {
+      ok: false,
+      error: `${e.code ?? 'IO_ERROR'}: ${e.message}`,
+      retryable: false,
+    };
+  }
+
   await walk(resolved, 0, 0);
-  return lines.join('\n');
+
+  if (truncatedByLimit) lines.push(`... (truncated, limit ${LIMIT})`);
+  if (depthLimitHit) lines.push(`... (depth limit ${args.depth} reached, deeper entries hidden)`);
+
+  const relRoot = path.relative(workspaceRoot, resolved) || '.';
+  const tree = lines.length ? lines.join('\n') : '(empty directory)';
+
+  return {
+    ok: true,
+    data: {
+      root: relRoot,
+      depthRequested: args.depth,
+      totalEntries: count,
+      truncatedByLimit,
+      depthLimitHit,
+      tree,
+    },
+    forLLM: `${relRoot}/\n${tree}`,
+  };
 }

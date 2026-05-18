@@ -4,12 +4,16 @@ import {
   type AgentEvent,
   type AgentLoopOptions,
   type AgentLoopResult,
+  type GateDecision,
   type StopReason,
+  type ToolResult,
 } from './types.ts';
 
 export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
   const maxRounds = opts.maxRounds ?? AGENT_LOOP_DEFAULTS.maxRounds;
+  const maxToolAttempts = opts.maxToolAttempts ?? AGENT_LOOP_DEFAULTS.maxToolAttempts;
   const temperature = opts.temperature ?? AGENT_LOOP_DEFAULTS.temperature;
+  const gates = opts.gates ?? [];
   const emit = (e: AgentEvent) => opts.onEvent?.(e);
 
   // ① 工具 schema 在整个 loop 里都不变，提前算一次即可。
@@ -76,7 +80,7 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
         return finish('natural', final, round);
       }
 
-      // ③ 执行所有 tool_calls，把结果以 role:'tool' 追加回 messages。
+      // ③ 执行所有 tool_calls (D7: 加 retry + gate pipeline)。
       for (const call of msg.tool_calls) {
         emit({
           type: 'tool_call',
@@ -86,20 +90,107 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
         });
 
         const t0 = Date.now();
-        let result: string;
-        let isError = false;
-
         const tool = opts.tools[call.function.name];
+
+        let result: ToolResult;
+        let parsedArgs: unknown = null;
+        let attempt = 0;
+
         if (!tool) {
-          result = `Error: unknown tool "${call.function.name}". Available: ${Object.keys(opts.tools).join(', ')}`;
-          isError = true;
+          result = {
+            ok: false,
+            error: `unknown tool "${call.function.name}". Available: ${Object.keys(opts.tools).join(', ')}`,
+            retryable: false,
+            forLLM: `Error: unknown tool "${call.function.name}"`,
+          };
+          attempt = 1;
         } else {
-          try {
-            const args = JSON.parse(call.function.arguments);
-            result = await tool.handler(args);
-          } catch (err) {
-            result = `Error: ${(err as Error).message}`;
-            isError = true;
+          // ③.1 Tool-level retry —— 只为 retryable 临时错误循环, 永久错误一遍喂回 LLM
+          while (true) {
+            attempt++;
+            try {
+              parsedArgs = JSON.parse(call.function.arguments);
+              result = await tool.handler(parsedArgs);
+            } catch (err) {
+              result = {
+                ok: false,
+                error: `args parse / handler crash: ${(err as Error).message}`,
+                retryable: false,
+                forLLM: `Error: ${(err as Error).message}`,
+              };
+            }
+
+            if (!result.ok && result.retryable && attempt < maxToolAttempts) {
+              emit({
+                type: 'tool_retry',
+                name: call.function.name,
+                attempt,
+                reason: result.error,
+              });
+              continue;
+            }
+            break;
+          }
+        }
+
+        // ③.2 Gate pipeline (post-execution)
+        let finalForLLM =
+          result.forLLM
+          ?? (result.ok
+            ? JSON.stringify(result.data, null, 2)
+            : `Error: ${result.error}`);
+        let gateAction: GateDecision['action'] = 'pass';
+        let gateReason: string | null = null;
+
+        if (tool) {
+          for (const gate of gates) {
+            const decision = await gate({
+              toolName: call.function.name,
+              args: parsedArgs,
+              result,
+              round,
+              attempt,
+            });
+
+            if (decision.action === 'pass') continue;
+
+            gateAction = decision.action;
+
+            if (decision.action === 'rewrite') {
+              finalForLLM = decision.newForLLM;
+              gateReason = 'rewrite';
+              break;
+            }
+
+            if (decision.action === 'retry') {
+              gateReason = decision.reason;
+              finalForLLM = `${finalForLLM}\n\n[Gate failed] ${decision.reason}\nPlease adjust your tool arguments and try again.`;
+              break;
+            }
+
+            if (decision.action === 'abort') {
+              gateReason = decision.reason;
+              emit({
+                type: 'gate_fail',
+                toolName: call.function.name,
+                action: 'abort',
+                reason: decision.reason,
+              });
+              messages.push({
+                role: 'tool',
+                tool_call_id: call.id,
+                content: `Aborted by safety gate: ${decision.reason}`,
+              });
+              emit({
+                type: 'tool_result',
+                id: call.id,
+                name: call.function.name,
+                result: `Aborted by safety gate: ${decision.reason}`,
+                durationMs: Date.now() - t0,
+                isError: true,
+              });
+              return finish('gate_abort', null, round);
+            }
           }
         }
 
@@ -109,15 +200,24 @@ export async function agentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult
           type: 'tool_result',
           id: call.id,
           name: call.function.name,
-          result,
+          result: finalForLLM,
           durationMs,
-          isError,
+          isError: !result.ok || gateAction !== 'pass',
         });
+
+        if (gateAction !== 'pass' && gateAction !== 'abort') {
+          emit({
+            type: 'gate_fail',
+            toolName: call.function.name,
+            action: gateAction,
+            reason: gateReason ?? 'unknown',
+          });
+        }
 
         messages.push({
           role: 'tool',
           tool_call_id: call.id,
-          content: result,
+          content: finalForLLM,
         });
       }
 

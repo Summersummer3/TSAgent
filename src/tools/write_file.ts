@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
+import type { ToolResult } from '../agent/types.ts';
 
 // ─────────────────────────────────────────────────────────────────────
 // TODO: 完成 zod schema 定义
@@ -93,25 +94,62 @@ export const writeFileTool: ChatCompletionTool = {
 //     d3-multi-tools.ts 主流程里有 try/catch 会把错误回传给 LLM
 // ─────────────────────────────────────────────────────────────────────
 
-export async function writeFile(rawArgs: unknown): Promise<string> {
-  // YOUR CODE HERE
-  const args = WriteFileArgs.parse(rawArgs);
+export interface WriteFileData {
+  path: string;        // relative to workspace
+  bytes: number;
+  mode: 'overwrite' | 'append';
+}
+
+/**
+ * D7 重构: 返回 ToolResult<WriteFileData>。
+ * 错误用 ok:false 表达 (路径越界、IO 错), 不再 throw —— LLM 看到错能自愈。
+ */
+export async function writeFile(
+  rawArgs: unknown,
+): Promise<ToolResult<WriteFileData>> {
+  const parsed = WriteFileArgs.safeParse(rawArgs);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: `invalid args: ${parsed.error.issues
+        .map((i) => `${i.path.join('.')}: ${i.message}`)
+        .join('; ')}`,
+      retryable: false,
+    };
+  }
+  const args = parsed.data;
+
   const workspaceRoot = process.cwd();
   const resolved = path.resolve(workspaceRoot, args.path);
   if (!resolved.startsWith(workspaceRoot)) {
-    throw new Error(`Refused: path "${args.path}" resolves outside the workspace (${resolved}).`);
+    return {
+      ok: false,
+      error: `Refused: path "${args.path}" resolves outside the workspace (${resolved}).`,
+      retryable: false,
+    };
   }
-  await fs.mkdir(path.dirname(resolved), { recursive: true });
+
   try {
+    await fs.mkdir(path.dirname(resolved), { recursive: true });
     if (args.mode === 'overwrite') {
-        await fs.writeFile(resolved, args.content, 'utf-8');
+      await fs.writeFile(resolved, args.content, 'utf-8');
     } else {
-        await fs.appendFile(resolved, args.content, 'utf-8');
+      await fs.appendFile(resolved, args.content, 'utf-8');
     }
-  } catch (error) {
-    throw new Error(`Failed to write file ${resolved}: ${(error as Error).message}`);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    return {
+      ok: false,
+      error: `${e.code ?? 'IO_ERROR'}: ${e.message}`,
+      retryable: false,
+    };
   }
-  
-  const bytesWritten = Buffer.byteLength(args.content, 'utf-8');
-  return `Wrote ${bytesWritten} bytes to ${args.path} (mode=${args.mode})`;
+
+  const bytes = Buffer.byteLength(args.content, 'utf-8');
+  const relPath = path.relative(workspaceRoot, resolved) || args.path;
+  return {
+    ok: true,
+    data: { path: relPath, bytes, mode: args.mode },
+    forLLM: `Wrote ${bytes} bytes to ${relPath} (mode=${args.mode})`,
+  };
 }

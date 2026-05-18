@@ -10,6 +10,7 @@
     "d3": "tsx src/d3-multi-tools.ts",
     "d4": "tsx src/d4-bash.ts",
     "d5": "tsx src/d5-agent.ts",
+    "d7": "tsx src/d7-gated-agent.ts",
     "all": "tsx scripts/run-all.ts",
     "dev": "tsx watch src/d1-hello.ts",
     "typecheck": "tsc --noEmit"

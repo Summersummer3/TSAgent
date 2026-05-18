@@ -90,11 +90,13 @@ async function main() {
     console.log(`[Tool exec] ${call.function.name}(${call.function.arguments})`);
 
     // YOUR CODE HERE — 解析参数、执行工具、push tool 消息
+    // D7 注: read_file 已重构为返回 ToolResult, 这里 unwrap 成字符串保持 D2 demo 简洁。
     let result: string;
     try {
       const args = JSON.parse(call.function.arguments);
       if (call.function.name === 'read_file') {
-        result = await readFile(args);
+        const r = await readFile(args);
+        result = r.forLLM ?? (r.ok ? r.data.content : `Error: ${r.error}`);
       } else {
         result = `Error: unknown tool ${call.function.name}`;
       }

@@ -2,12 +2,19 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
+import type { ToolResult } from '../agent/types.ts';
 
 const ReadFileArgs = z.object({
   path: z.string().min(1, 'path is required'),
 });
 
 export type ReadFileArgs = z.infer<typeof ReadFileArgs>;
+
+export interface ReadFileData {
+  path: string;
+  bytes: number;
+  content: string;
+}
 
 export const readFileTool: ChatCompletionTool = {
   type: 'function',
@@ -30,18 +37,58 @@ export const readFileTool: ChatCompletionTool = {
   },
 };
 
-export async function readFile(rawArgs: unknown): Promise<string> {
-  const args = ReadFileArgs.parse(rawArgs);
-
-  const workspaceRoot = process.cwd();
-  const resolved = path.resolve(workspaceRoot, args.path);
-
-  if (!resolved.startsWith(workspaceRoot)) {
-    throw new Error(
-      `Refused: path "${args.path}" resolves outside the workspace (${resolved}).`,
-    );
+/**
+ * D7 重构: 返回 ToolResult<ReadFileData>, 不再裸返回 string。
+ *
+ * 设计要点:
+ *  - data: 结构化对象, 让 Gate 可以编程式检查 (比如 bytes 太大 → truncate)
+ *  - forLLM: 字符串, 给 LLM 看的版本 (它只关心 content)
+ *  - 所有失败都用 ok:false 表达, 不 throw —— 这样错误会被喂回 LLM,
+ *    符合 Manus "保留错误的内容" 原则; LLM 看到 error 后会自己改 args 重试。
+ *  - retryable 只能出现在 ok:false 上 (成功不需要重试这件事 TS 已经帮你拦)。
+ */
+export async function readFile(
+  rawArgs: unknown,
+): Promise<ToolResult<ReadFileData>> {
+  const parsed = ReadFileArgs.safeParse(rawArgs);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: `invalid args: ${parsed.error.issues
+        .map((i) => `${i.path.join('.')}: ${i.message}`)
+        .join('; ')}`,
+      retryable: false,
+    };
   }
 
-  const content = await fs.readFile(resolved, 'utf-8');
-  return content;
+  const workspaceRoot = process.cwd();
+  const resolved = path.resolve(workspaceRoot, parsed.data.path);
+
+  if (!resolved.startsWith(workspaceRoot)) {
+    return {
+      ok: false,
+      error: `Refused: path "${parsed.data.path}" resolves outside the workspace (${resolved}).`,
+      retryable: false,
+    };
+  }
+
+  try {
+    const content = await fs.readFile(resolved, 'utf-8');
+    return {
+      ok: true,
+      data: {
+        path: path.relative(workspaceRoot, resolved) || parsed.data.path,
+        bytes: Buffer.byteLength(content, 'utf-8'),
+        content,
+      },
+      forLLM: content,
+    };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    return {
+      ok: false,
+      error: `${e.code ?? 'IO_ERROR'}: ${e.message}`,
+      retryable: false,
+    };
+  }
 }

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
+import type { ToolResult } from '../agent/types.ts';
 
 // ─────────────────────────────────────────────────────────────────────
 // TODO 1: 完成 zod schema
@@ -192,20 +193,98 @@ function runProcess(command: string, timeoutMs: number): Promise<ProcessResult> 
 //      这种格式 LLM 一眼能读懂。
 // ─────────────────────────────────────────────────────────────────────
 
-export async function runBash(rawArgs: unknown): Promise<string> {
-  // YOUR CODE HERE
-  const args = RunBashArgs.parse(rawArgs);
+export interface RunBashData {
+  command: string;
+  exitCode: number;
+  stdout: string;          // already truncated
+  stderr: string;          // already truncated
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  timedOut: boolean;
+  durationMs: number;
+}
+
+/**
+ * D7 重构: 返回 ToolResult<RunBashData>。
+ *
+ * ok 语义 (慎重设计):
+ *   - 黑名单拒绝   → ok:false retryable:false
+ *   - spawn 失败   → ok:false retryable:false (exitCode = -1)
+ *   - 命令跑完, exit code 非 0 → 仍 ok:true (这是子进程业务, LLM 应该看 stdout/stderr 决定)
+ *   - 超时被 SIGKILL → 仍 ok:true, data.timedOut = true
+ *
+ * 关键洞察: "工具是否成功执行" ≠ "命令是否业务成功", 别混在一起,
+ * 否则 LLM 会把 "exit 1" 当工具失败, 失去自适应能力。
+ */
+export async function runBash(
+  rawArgs: unknown,
+): Promise<ToolResult<RunBashData>> {
+  const parsed = RunBashArgs.safeParse(rawArgs);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: `invalid args: ${parsed.error.issues
+        .map((i) => `${i.path.join('.')}: ${i.message}`)
+        .join('; ')}`,
+      retryable: false,
+    };
+  }
+  const args = parsed.data;
+
   const trigger = isDangerous(args.command);
-  if (trigger) return `Refused: ${trigger}`;
+  if (trigger) {
+    return {
+      ok: false,
+      error: `Refused by blacklist: ${trigger}`,
+      retryable: false,
+      forLLM: `Refused: ${trigger}. Pick a different approach.`,
+    };
+  }
+
+  const t0 = Date.now();
   const result = await runProcess(args.command, args.timeoutMs);
-  const stdout = truncate(result.stdout, 4000);
-  const stderr = truncate(result.stderr, 1000);
-  return [
+  const durationMs = Date.now() - t0;
+
+  // spawn 失败 (例 ENOENT) 标 ok:false; 真正"跑过"的命令一律 ok:true
+  if (result.exitCode === -1 && result.stderr.startsWith('spawn error:')) {
+    return {
+      ok: false,
+      error: result.stderr,
+      retryable: false,
+      forLLM: `Error: ${result.stderr}`,
+    };
+  }
+
+  const STDOUT_LIMIT = 4000;
+  const STDERR_LIMIT = 1000;
+  const stdoutTruncated = result.stdout.length > STDOUT_LIMIT;
+  const stderrTruncated = result.stderr.length > STDERR_LIMIT;
+  const stdout = truncate(result.stdout, STDOUT_LIMIT);
+  const stderr = truncate(result.stderr, STDERR_LIMIT);
+
+  const forLLM = [
     `Exit code: ${result.exitCode}`,
     `Timed out: ${result.timedOut}`,
-    `STDOUT: ${stdout}`,
-    `STDERR: ${stderr}`,
+    `STDOUT:`,
+    stdout || '(empty)',
+    `STDERR:`,
+    stderr || '(empty)',
   ].join('\n');
+
+  return {
+    ok: true,
+    data: {
+      command: args.command,
+      exitCode: result.exitCode,
+      stdout,
+      stderr,
+      stdoutTruncated,
+      stderrTruncated,
+      timedOut: result.timedOut,
+      durationMs,
+    },
+    forLLM,
+  };
 }
 
 // 小工具：你 TODO 4 截断时用
